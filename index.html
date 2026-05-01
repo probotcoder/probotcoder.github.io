@@ -27,6 +27,7 @@
             overflow-x: hidden;
         }
 
+        /* HEADER */
         .header {
             background: rgba(18,18,18,0.95);
             backdrop-filter: blur(20px);
@@ -99,6 +100,7 @@
         }
         .sidebar-toggle:hover { background: #1a1a1a; border-color: var(--green); }
 
+        /* LAYOUT */
         .layout { display: flex; min-height: calc(100vh - 56px); position: relative; }
         .sidebar {
             width: var(--sidebar-w); min-width: var(--sidebar-w); background: rgba(8,8,8,0.95);
@@ -187,6 +189,7 @@
         .live-min.ft-label { color: #888; }
         .countdown-text { font-size: 0.75rem; color: #ffaa00; font-weight: bold; display: block; margin-top: 4px; }
 
+        /* MODAL */
         #modal {
             display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
             background: rgba(0,0,0,0.96); z-index: 1000; backdrop-filter: blur(8px);
@@ -232,6 +235,7 @@
         #modal-header { padding: 16px; text-align: center; border-bottom: 1px solid #333; }
         #m-stadium-ref { font-size: 0.8rem; color: #aaa; margin-top: 6px; display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; }
 
+        /* AI Predicted Lineup Styles */
         .predicted-header {
             font-weight: 700;
             border-bottom: 1px solid #333;
@@ -268,6 +272,7 @@
         }
         .substitute-item span { color: #888; margin-right: 4px; }
 
+        /* Unavailable Players */
         .unavailable-container {
             display: flex;
             flex-wrap: wrap;
@@ -336,6 +341,7 @@
         <h1>PROSCORE<span>LIVE</span></h1>
         <div class="header-nav" id="header-nav">
             <button class="active" onclick="setView('matches')">Matches</button>
+            <button onclick="setView('players')">Players</button>
             <button onclick="setView('managers')">Managers</button>
         </div>
     </div>
@@ -345,7 +351,7 @@
 <div class="layout">
     <aside class="sidebar" id="sidebar">
         <div class="sidebar-search">
-            <input type="text" id="league-search" placeholder="Search leagues..." oninput="debounceFilterLeagues()">
+            <input type="text" id="league-search" placeholder="Search leagues..." oninput="filterLeagues()">
         </div>
         <div class="sidebar-header">
             <span>🏆 Leagues</span>
@@ -405,9 +411,12 @@
     const TOKEN = '664f63e05993a56481b4eaef1f51070a3e89eeeb';
     const API_BASE = 'https://sports.bzzoiro.com/api/events/';
     const LEAGUES_API = 'https://sports.bzzoiro.com/api/leagues/';
+    const PLAYERS_API = 'https://sports.bzzoiro.com/api/players/';
     const MANAGERS_API = 'https://sports.bzzoiro.com/api/managers/';
     const PREDICTED_LINEUP_API = 'https://sports.bzzoiro.com/api/predicted-lineup/';
-    const DEFAULT_TEAM_ID = 0;
+
+    // OPTIONAL: Filter players/managers by a specific team ID (e.g. 12 from your CURL example)
+    const DEFAULT_TEAM_ID = 0; 
 
     let allMatches = [];
     let allLeaguesFull = [];
@@ -417,8 +426,6 @@
     let currentModalMatchId = null;
     let modalLiveInterval = null;
     let currentView = 'matches';
-    let filterTimeout;
-    let globalPredictedCache = new Map(); // Cache predicted data per match ID
 
     function escapeHTML(str) { return str ? String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : ''; }
     function escapeJS(str) { return str ? String(str).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"') : ''; }
@@ -458,6 +465,7 @@
                 if (c.trim().length > 2) return c.trim();
             }
         }
+        for (const c of candidates) if (c && typeof c === 'string') { const mapped = POS_MAP[c.trim()] || POS_MAP[c.trim().toUpperCase()]; if (mapped) return mapped; }
         return '';
     }
 
@@ -467,7 +475,34 @@
         if (m.elapsed && !isNaN(m.elapsed)) return parseInt(m.elapsed);
         if (m.live_minute && !isNaN(m.live_minute)) return parseInt(m.live_minute);
         if (m.match_time?.current_minute && !isNaN(m.match_time.current_minute)) return parseInt(m.match_time.current_minute);
+        if (m.status && typeof m.status === 'string') { const num = parseInt(m.status); if (!isNaN(num)) return num; }
         return 0;
+    }
+
+    function isSecondHalf(m) {
+        // CRITICAL FIX: Aggressively check for second half indicators
+        if (m.timer?.period === 2) return true;
+        if (m.match_time?.period === 2) return true;
+        if (m.period === 2) return true;
+        // Check status labels
+        const status = (m.status || m.state || m.match_status || '').toUpperCase();
+        if (status.includes('2H') || status.includes('SECOND_HALF') || status.includes('2ND_HALF')) return true;
+        // Fallback: If the match is live and elapsed time is > 45 minutes, assume second half
+        if (getMatchState(m) === 'LIVE' && getMatchMinute(m) > 45) return true;
+        return false;
+    }
+
+    function getDisplayMinute(m) {
+        // FIX: Prioritize match_time.current_minute if it exists and makes sense
+        if (m.match_time?.current_minute && !isNaN(m.match_time.current_minute) && m.match_time.current_minute > 45) {
+            return m.match_time.current_minute;
+        }
+        let minute = getMatchMinute(m);
+        // If minute is suspiciously low (like 1) but we know it is second half, bump it
+        if (isSecondHalf(m) && minute <= 45) minute += 45;
+        // If minute is > 90 but match isn't finished, cap it at 90+ for visual clarity
+        if (minute > 90 && getMatchState(m) !== 'FINISHED') minute = 90;
+        return minute;
     }
 
     function getMatchState(m) {
@@ -507,15 +542,16 @@
     function getDayLabel(ts) {
         const now = new Date();
         const targetDate = new Date(ts);
-        now.setHours(0,0,0,0);
-        targetDate.setHours(0,0,0,0);
-        const diffDays = Math.round((targetDate - now) / (1000*60*60*24));
+        now.setHours(0, 0, 0, 0);
+        targetDate.setHours(0, 0, 0, 0);
+        const diffDays = Math.round((targetDate - now) / (1000 * 60 * 60 * 24));
         if (diffDays === 0) return 'Today';
         if (diffDays === 1) return 'Tmrw';
         if (diffDays > 1 && diffDays <= 6) {
-            return ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][targetDate.getDay()];
+            const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+            return days[targetDate.getDay()];
         }
-        return targetDate.toLocaleDateString('en-GB',{day:'2-digit',month:'short'});
+        return targetDate.toLocaleDateString('en-GB', {day:'2-digit',month:'short'});
     }
 
     function getCountdownText(ts) {
@@ -527,22 +563,6 @@
         if (diffMinutes < 60) return `${diffMinutes}m left`;
         if (diffHours < 6) return `${diffHours}h left`;
         return null;
-    }
-
-    // ---------- LIVE TIMER (ticks seconds) ----------
-    function updateLiveTimers() {
-        const now = Date.now();
-        document.querySelectorAll('.live-min[data-start]').forEach(el => {
-            const startTs = parseInt(el.dataset.start);
-            if (startTs) {
-                const elapsedSec = Math.floor((now - startTs) / 1000);
-                if (elapsedSec < 0) return;
-                const mins = Math.floor(elapsedSec / 60);
-                const secs = elapsedSec % 60;
-                el.textContent = `${mins}:${secs.toString().padStart(2,'0')}'`;
-            }
-        });
-        updateCountdowns();
     }
 
     function renderMatchCard(m) {
@@ -566,12 +586,9 @@
         } else if (state === 'LIVE') {
             const hScore = m.home_score ?? 0;
             const aScore = m.away_score ?? 0;
+            const displayMin = getDisplayMinute(m);
             scoreHTML = `<span class="score-text live-score">${hScore}-${aScore}</span>`;
-            // Store start timestamp for live timer, else show minute from API
-            const startAttr = ts ? `data-start="${ts}"` : '';
-            const fallbackMin = getMatchMinute(m) + (isSecondHalf(m) && getMatchMinute(m) <= 45 ? 45 : 0);
-            const displayText = ts ? '...' : `${fallbackMin}'`;
-            statusHTML = `<span class="live-min" ${startAttr}>${displayText}</span>`;
+            statusHTML = `<span class="live-min">${displayMin}'</span>`;
         } else {
             const hScore = m.home_score ?? 0;
             const aScore = m.away_score ?? 0;
@@ -588,14 +605,6 @@
             </div>
             <div class="match-team away">${escapeHTML(aName)}</div>
         </div>`;
-    }
-
-    function isSecondHalf(m) {
-        if (m.timer?.period === 2 || m.match_time?.period === 2 || m.period === 2) return true;
-        const status = (m.status || m.state || '').toUpperCase();
-        if (status.includes('2H') || status.includes('SECOND_HALF')) return true;
-        if (getMatchState(m) === 'LIVE' && getMatchMinute(m) > 45) return true;
-        return false;
     }
 
     function updateCountdowns() {
@@ -653,10 +662,12 @@
             if (currentView === 'matches') {
                 renderMainContent();
                 updateHeaderInfo();
+            } else if (currentView === 'players') {
+                fetchAndRenderPlayers();
             } else if (currentView === 'managers') {
                 fetchAndRenderManagers();
             }
-            updateLiveTimers();
+            updateCountdowns();
             if (currentModalMatchId && document.getElementById('modal').style.display === 'block') {
                 refreshModalMatchData(currentModalMatchId);
             }
@@ -668,7 +679,7 @@
     function updateHeaderInfo() {
         const totalLive = allMatches.filter(m => getMatchState(m) === 'LIVE').length;
         document.getElementById('header-info').innerHTML = totalLive > 0
-            ? `${totalLive} live · ${allMatches.length} matches`
+            ? `<span class="header-live-dot"></span> ${totalLive} live · ${allMatches.length} matches`
             : `${allMatches.length} matches loaded`;
     }
 
@@ -701,10 +712,6 @@
         listEl.innerHTML = html || '<div style="padding:15px;color:#555;text-align:center;">No leagues found</div>';
     }
 
-    function debounceFilterLeagues() {
-        clearTimeout(filterTimeout);
-        filterTimeout = setTimeout(() => filterLeagues(), 200);
-    }
     function filterLeagues() { renderSidebar(document.getElementById('league-search').value); }
     function selectLeague(leagueName) {
         selectedLeague = leagueName;
@@ -725,7 +732,7 @@
             const leagueMatches = leagueMap.get(selectedLeague) || [];
             mainEl.innerHTML = renderSingleLeague(selectedLeague, leagueMatches);
         }
-        updateLiveTimers();
+        updateCountdowns();
     }
 
     function renderGroupedByLeague(matches) {
@@ -760,7 +767,9 @@
     }
 
     function renderSingleLeague(leagueName, matches) {
-        if (matches.length === 0) return `<div class="league-group"><div class="league-title">${escapeHTML(leagueName)}</div><div class="empty-state">No matches this season.</div></div>`;
+        if (matches.length === 0) {
+            return `<div class="league-group"><div class="league-title">${escapeHTML(leagueName)}</div><div class="empty-state">No matches this season.</div></div>`;
+        }
         const live = matches.filter(m => getMatchState(m) === 'LIVE');
         const upcoming = matches.filter(m => getMatchState(m) === 'UPCOMING');
         const finished = matches.filter(m => getMatchState(m) === 'FINISHED');
@@ -774,7 +783,6 @@
         return html;
     }
 
-    // ---------- MODAL / MATCH DETAILS ----------
     async function fetchMatchDetails(id, home, away) {
         document.getElementById('modal').style.display = 'block';
         currentModalMatchId = id;
@@ -785,6 +793,8 @@
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
         document.getElementById('tab-timeline').style.display = 'block';
         document.querySelector('.tab-btn').classList.add('active');
+        document.getElementById('tab-pred-btn').style.display = 'none';
+        document.getElementById('tab-unavail-btn').style.display = 'none';
 
         try {
             const [eventRes, predictRes] = await Promise.allSettled([
@@ -798,9 +808,6 @@
             let predictedData = null;
             if (predictRes.status === 'fulfilled' && predictRes.value.ok) {
                 predictedData = await predictRes.value.json();
-                globalPredictedCache.set(id, predictedData); // cache
-            } else {
-                predictedData = globalPredictedCache.get(id) || null; // use cached if present
             }
 
             populateModalWithMatch(m, home, away, predictedData);
@@ -822,37 +829,15 @@
             let predictedData = null;
             if (predictRes.status === 'fulfilled' && predictRes.value.ok) {
                 predictedData = await predictRes.value.json();
-                globalPredictedCache.set(id, predictedData);
-            } else {
-                predictedData = globalPredictedCache.get(id) || null;
             }
             const home = document.getElementById('m-title').innerText.split(' vs ')[0] || 'Home';
             const away = document.getElementById('m-title').innerText.split(' vs ')[1] || 'Away';
             populateModalWithMatch(m, home, away, predictedData);
-        } catch(e) {}
-    }
-
-    function getXGValue(m, side) {
-        // side = 'home' or 'away'
-        const paths = [
-            m[`${side}_xg_live`],
-            m.live_stats?.[side]?.xg,
-            m.statistics?.[side]?.xg,
-            m.stats?.[side]?.xg,
-            m[`${side}_xg`],
-        ];
-        for (const val of paths) if (val !== undefined && val !== null && !isNaN(val)) return val;
-        return null;
+        } catch(e) { /* Silently fail refresh */ }
     }
 
     function populateModalWithMatch(m, home, away, predictedData) {
-        const homeXG = getXGValue(m, 'home');
-        const awayXG = getXGValue(m, 'away');
-        const xgString = (homeXG !== null && awayXG !== null) 
-            ? `xG: ${homeXG.toFixed(2)} - ${awayXG.toFixed(2)}` 
-            : `xG: N/A`;
-        document.getElementById('m-xg-time').innerHTML = `${xgString} | Status: ${m.status || 'N/A'}`;
-
+        document.getElementById('m-xg-time').innerHTML = `xG: ${(m.home_xg_live||0).toFixed(2)} - ${(m.away_xg_live||0).toFixed(2)} | Status: ${m.status || 'N/A'}`;
         const stadium = m.venue?.name || m.venue || m.stadium || m.location || '';
         const referee = m.referee?.name || m.referee || m.official || '';
         document.getElementById('m-stadium-ref').innerHTML = 
@@ -861,17 +846,11 @@
 
         const state = getMatchState(m);
         const predBtn = document.getElementById('tab-pred-btn');
-        const unavailBtn = document.getElementById('tab-unavail-btn');
-
-        // Predicted lineup only before start
-        predBtn.style.display = (state === 'UPCOMING' && predictedData?.lineups) ? 'inline-block' : 'none';
-
-        // Absentees visible if data available (cached or live)
-        const hasUnavailable = predictedData?.lineups && (
-            (predictedData.lineups.home?.unavailable?.length > 0) ||
-            (predictedData.lineups.away?.unavailable?.length > 0)
-        );
-        unavailBtn.style.display = hasUnavailable ? 'inline-block' : 'none';
+        if (state === 'UPCOMING' && predictedData && predictedData.lineups) {
+            predBtn.style.display = 'inline-block';
+        } else {
+            predBtn.style.display = 'none';
+        }
 
         // Timeline
         const timeline = document.getElementById('tab-timeline');
@@ -884,31 +863,31 @@
             const side = isHome ? home : away;
             const mainPlayer = resolveName(e.player) || resolveName(e.scorer) || e.player_name || e.playerName || resolveName(e) || 'Unknown';
             let icon = '•', detail = '';
-            if (rawType.includes('penalty') && (rawType.includes('miss')||rawType.includes('saved')||e.missed||e.saved)) {
+            if (rawType.includes('penalty') && (rawType.includes('miss')||rawType.includes('missed')||rawType.includes('saved')||rawType.includes('off_target')||e.missed||e.saved||e.penalty_missed||e.penalty_saved)) {
                 icon = '❌';
-                const isSaved = rawType.includes('saved') || e.saved;
+                const isSaved = rawType.includes('saved') || e.saved || e.penalty_saved;
                 const missLabel = isSaved ? '<span style="color:#ff4444;font-weight:bold;">Penalty Saved!</span>' : '<span style="color:#ff4444;font-weight:bold;">Penalty Missed!</span>';
                 detail = `<b>${mainPlayer}</b> ${missLabel} <span style="color:#555;">· ${side}</span>`;
             } else if (rawType.includes('goal') && !rawType.includes('missed') && !rawType.includes('saved')) {
-                const isPenalty = rawType.includes('penalty') || e.penalty;
+                const isPenalty = rawType.includes('penalty') || e.penalty || e.is_penalty || e.penalty_goal;
                 const isOwnGoal = rawType.includes('own') || e.own_goal;
                 icon = '⚽';
-                if (isOwnGoal) detail = `<b>${mainPlayer}</b> <span style="color:#ff4444;">(Own Goal)</span> <span style="color:#555;">· ${side}</span>`;
-                else if (isPenalty) detail = `<b>${mainPlayer}</b> <span style="color:#ffcc00;">(Penalty Goal)</span> <span style="color:#555;">· ${side}</span>`;
+                if (isOwnGoal) detail = `<b>${mainPlayer}</b> <span style="color:#ff4444;font-weight:bold;">(Own Goal)</span> <span style="color:#555;">· ${side}</span>`;
+                else if (isPenalty) detail = `<b>${mainPlayer}</b> <span style="color:#ffcc00;font-weight:bold;">(Penalty Goal)</span> <span style="color:#555;">· ${side}</span>`;
                 else {
-                    const asst = resolveName(e.assist) || resolveName(e.assist_player);
-                    detail = `<b>${mainPlayer}</b> <span style="color:var(--green);">(Goal)</span> <span style="color:#555;">· ${side}</span>`;
+                    const asst = resolveName(e.assist) || resolveName(e.assist_player) || resolveName(e.assistPlayer);
+                    detail = `<b>${mainPlayer}</b> <span style="color:var(--green);font-weight:bold;">(Goal)</span> <span style="color:#555;">· ${side}</span>`;
                     if (asst) detail += `<br><small style="color:#888;">Assisted by ${asst}</small>`;
                 }
-            } else if (rawType.includes('card')) {
+            } else if (rawType.includes('card')||rawType.includes('yellow')||rawType.includes('red')) {
                 const isRed = rawType.includes('red') || e.card_type==='red';
                 icon = isRed ? '🟥' : '🟨';
                 detail = `<b>${mainPlayer}</b> <span style="color:#888;">(${isRed?'Red Card':'Yellow Card'})</span>`;
-            } else if (rawType.includes('sub')) {
+            } else if (rawType.includes('sub')||rawType.includes('substitut')) {
                 icon = '🔄';
-                const pIn = resolveName(e.player_in)||resolveName(e.in)||'?';
-                const pOut = resolveName(e.player_out)||resolveName(e.out)||mainPlayer;
-                detail = `<span style="color:var(--green)">▲ ${pIn}</span> <span style="color:#ff4444">▼ ${pOut}</span>`;
+                const pIn = resolveName(e.player_in)||resolveName(e.in)||resolveName(e.playerIn);
+                const pOut = resolveName(e.player_out)||resolveName(e.out)||resolveName(e.playerOut)||mainPlayer;
+                detail = `<span style="color:var(--green)">▲ ${pIn||'N/A'}</span> <span style="color:#ff4444">▼ ${pOut}</span>`;
             } else { detail = `<b>${mainPlayer!=='Unknown'?mainPlayer:''}</b> <span style="color:#777;">(${rawType||'event'})</span>`; }
             timeline.innerHTML += `<div class="event-row"><div class="event-min">${e.minute||e.time||'0'}'</div><div class="event-main"><div class="event-team">${side}</div>${icon} ${detail}</div></div>`;
         });
@@ -918,19 +897,23 @@
         let hPlayers=[], aPlayers=[], hFormation='', aFormation='', hManager='', aManager='';
         if (lineupSource) {
             if (Array.isArray(lineupSource)) {
-                hPlayers = lineupSource.filter(p => p.is_home || p.team==='home');
+                hPlayers = lineupSource.filter(p => p.is_home || p.team==='home' || p.team_id===(m.home_team_id||m.home_team?.id));
                 aPlayers = lineupSource.filter(p => !p.is_home && p.team!=='home');
             } else {
                 const hSrc = lineupSource.home || lineupSource.local || lineupSource[0];
                 const aSrc = lineupSource.away || lineupSource.visitor || lineupSource[1];
-                hPlayers = hSrc?.players || hSrc?.starting_xi || (Array.isArray(hSrc)?hSrc:[]);
-                aPlayers = aSrc?.players || aSrc?.starting_xi || (Array.isArray(aSrc)?aSrc:[]);
-                hFormation = hSrc?.formation || hSrc?.formation_name || '';
-                aFormation = aSrc?.formation || aSrc?.formation_name || '';
-                hManager = resolveName(hSrc?.manager)||resolveName(hSrc?.coach)||'';
-                aManager = resolveName(aSrc?.manager)||resolveName(aSrc?.coach)||'';
+                hPlayers = hSrc?.players || hSrc?.starting_xi || hSrc?.lineup || (Array.isArray(hSrc)?hSrc:[]);
+                aPlayers = aSrc?.players || aSrc?.starting_xi || aSrc?.lineup || (Array.isArray(aSrc)?aSrc:[]);
+                hFormation = hSrc?.formation || hSrc?.formation_name || lineupSource.home_formation || '';
+                aFormation = aSrc?.formation || aSrc?.formation_name || lineupSource.away_formation || '';
+                hManager = resolveName(hSrc?.manager)||resolveName(hSrc?.coach)||hSrc?.manager_name||hSrc?.coach_name||'';
+                aManager = resolveName(aSrc?.manager)||resolveName(aSrc?.coach)||aSrc?.manager_name||aSrc?.coach_name||'';
             }
         }
+        hFormation = hFormation || m.home_formation || m.home_team?.formation || '';
+        aFormation = aFormation || m.away_formation || m.away_team?.formation || '';
+        hManager = hManager || resolveName(m.home_manager)||resolveName(m.home_coach)||m.home_manager_name||'';
+        aManager = aManager || resolveName(m.away_manager)||resolveName(m.away_coach)||m.away_manager_name||'';
         renderSquad('home-side', home, hPlayers, hFormation, hManager);
         renderSquad('away-side', away, aPlayers, aFormation, aManager);
 
@@ -940,7 +923,7 @@
         const h = s.home || s.home_team || {}, a = s.away || s.away_team || {};
         statsEl.innerHTML = `
             <div class="info-section">
-                <h4>Match Statistics</h4>
+                <h4 style="margin-top:0;">Match Statistics</h4>
                 <div class="stat-row"><span>${h.ball_possession||0}%</span><b>Possession</b><span>${a.ball_possession||0}%</span></div>
                 <div class="stat-row"><span>${h.total_shots||0}</span><b>Shots</b><span>${a.total_shots||0}</span></div>
                 <div class="stat-row"><span>${h.shots_on_target||0}</span><b>On Target</b><span>${a.shots_on_target||0}</span></div>
@@ -962,8 +945,8 @@
                 const teamName = idx===0 ? home : away;
                 html += `<div class="team-column"><div class="team-meta-name">${escapeHTML(teamName)}</div>`;
                 sidePlayers.forEach(p => {
-                    const pName = resolveName(p) || 'Unknown';
-                    const rating = p.rating || p.player_rating || '';
+                    const pName = resolveName(p) || p.player_name || 'Unknown';
+                    const rating = p.rating || p.player_rating || p.performance_rating || '';
                     html += `<div class="rating-row"><span>${escapeHTML(pName)}</span><span class="player-rating">${rating || 'N/A'}</span></div>`;
                 });
                 html += '</div>';
@@ -972,23 +955,45 @@
             ratingsEl.innerHTML = html;
         }
 
-        // Predicted (only if upcoming)
+        // ------------------ PREDICTED LINEUP (AI) ------------------
         const predEl = document.getElementById('tab-predicted');
-        if (state === 'UPCOMING' && predictedData?.lineups) {
-            let html = `<h4>🤖 AI Predicted Lineups <span class="confidence-badge">Beta</span></h4>`;
-            const sides = ['home','away'];
+        if (predictedData && predictedData.lineups) {
+            let html = `<h4 style="margin-top:0;">🤖 AI Predicted Lineups <span class="confidence-badge">Beta ${predictedData.beta ? '⚡' : ''}</span></h4>`;
+            const sides = ['home', 'away'];
             const names = [home, away];
             sides.forEach((side, idx) => {
                 const sideData = predictedData.lineups[side];
                 if (sideData) {
-                    html += `<div style="margin-top:15px; background:#1a1a1a; padding:12px; border-radius:8px; border:1px solid #2a2a2a;">`;
-                    html += `<div style="font-weight:600;color:#aaa;">🏷️ ${escapeHTML(names[idx])}</div>`;
-                    html += `<div style="font-size:0.8rem;color:#888;">Formation: <b>${escapeHTML(sideData.predicted_formation||'?')}</b> | Confidence: <b>${sideData.confidence ? (sideData.confidence*100).toFixed(0)+'%' : 'N/A'}</b></div>`;
+                    html += `<div style="margin-top: 15px; background: #1a1a1a; padding: 12px; border-radius: 8px; border: 1px solid #2a2a2a;">`;
+                    html += `<div style="font-weight: 600; color: #aaa; margin-bottom: 8px;">🏷️ ${escapeHTML(names[idx])}</div>`;
+                    
+                    // Formation & Confidence
+                    const formation = sideData.predicted_formation || 'Unknown';
+                    const confidence = sideData.confidence ? (sideData.confidence * 100).toFixed(0) + '%' : 'N/A';
+                    html += `<div style="font-size:0.8rem; margin-bottom: 8px; color: #888;">Formation: <b style="color:var(--green);">${escapeHTML(formation)}</b> | Confidence: <b style="color:#ffcc00;">${confidence}</b></div>`;
+
+                    // Starters
                     html += `<div class="predicted-header">Starting XI</div>`;
-                    (sideData.starters||[]).forEach(p => html += `<div class="player-item"><span>${escapeHTML(p.name||'?')}</span><span style="color:#ffcc00;font-size:0.7rem;">${p.ai_score ? (p.ai_score*100).toFixed(0)+'%' : ''}</span></div>`);
-                    if (sideData.substitutes?.length) {
-                        html += `<div class="predicted-header" style="margin-top:10px;">Bench</div><div class="substitute-grid">`;
-                        sideData.substitutes.forEach(p => html += `<div class="substitute-item"><span>${p.position||''}</span> ${escapeHTML(p.name||'?')}</div>`);
+                    if (sideData.starters && sideData.starters.length > 0) {
+                        sideData.starters.forEach(p => {
+                            const pName = p.name || 'Unknown';
+                            const pos = p.position || '?';
+                            const score = p.ai_score ? (p.ai_score * 100).toFixed(0) + '%' : '';
+                            html += `<div class="player-item"><span>${escapeHTML(pName)} <span style="color:#666;font-size:0.7rem;">(${pos})</span></span><span style="color:#ffcc00;font-size:0.7rem;">${score}</span></div>`;
+                        });
+                    } else {
+                        html += `<div style="color:#555; font-size:0.8rem;">No starter predictions available.</div>`;
+                    }
+
+                    // Substitutes
+                    if (sideData.substitutes && sideData.substitutes.length > 0) {
+                        html += `<div class="predicted-header" style="margin-top: 10px;">Bench</div>`;
+                        html += `<div class="substitute-grid">`;
+                        sideData.substitutes.forEach(p => {
+                            const pName = p.name || 'Unknown';
+                            const pos = p.position || '';
+                            html += `<div class="substitute-item"><span>${pos}</span> ${escapeHTML(pName)}</div>`;
+                        });
                         html += `</div>`;
                     }
                     html += `</div>`;
@@ -996,52 +1001,89 @@
             });
             predEl.innerHTML = html;
         } else {
-            predEl.innerHTML = '<div style="text-align:center;padding:30px;color:#666;">Predicted lineup only available before match start.</div>';
+            predEl.innerHTML = '<div style="text-align:center;padding:30px;color:#666;"><div style="font-size:2rem;">🤖</div><p style="margin-top:10px;">No AI prediction available for this match.</p></div>';
         }
 
-        // Absentees (always show if data present, thanks to cache)
+        // ------------------ UNAVAILABLE PLAYERS (ABSENTEES) ------------------
         const unavailEl = document.getElementById('tab-unavail');
-        if (hasUnavailable) {
-            let html = `<h4>⚕️ Injured & Suspended Players</h4>`;
-            const sides = ['home','away'];
+        const unavailBtn = document.getElementById('tab-unavail-btn');
+        
+        if (predictedData && predictedData.lineups) {
+            unavailBtn.style.display = 'inline-block';
+            let html = `<div style="margin-bottom: 20px;"><h4>⚕️ Injured & Suspended Players</h4>`;
+            const sides = ['home', 'away'];
             const names = [home, away];
             sides.forEach((side, idx) => {
                 const sideData = predictedData.lineups[side];
-                if (sideData?.unavailable?.length) {
-                    html += `<div style="margin-top:15px; background:#1a1a1a; padding:12px; border-radius:8px; border:1px solid #2a2a2a;">`;
-                    html += `<div style="font-weight:600;color:#aaa;">🚑 ${escapeHTML(names[idx])}</div><div class="unavailable-container">`;
+                if (sideData && sideData.unavailable && sideData.unavailable.length > 0) {
+                    html += `<div style="margin-top: 15px; background: #1a1a1a; padding: 12px; border-radius: 8px; border: 1px solid #2a2a2a;">`;
+                    html += `<div style="font-weight: 600; color: #aaa; margin-bottom: 8px;">🚑 ${escapeHTML(names[idx])}</div>`;
+                    html += `<div class="unavailable-container">`;
                     sideData.unavailable.forEach(u => {
-                        const reason = u.reason?.toLowerCase()||'';
-                        let badgeClass = reason.includes('suspended')||reason.includes('red')?'suspension':'injury';
+                        const reason = u.reason ? u.reason.toLowerCase() : 'unknown';
+                        let badgeClass = 'injury';
+                        let reasonClass = '';
+                        if (reason.includes('suspended') || reason.includes('red card') || reason.includes('card')) {
+                            badgeClass = 'suspension';
+                            reasonClass = 'suspension-reason';
+                        }
+                        
+                        // Extract Role/Injury/Return Date if the API provides them in the object or as meta fields
+                        // Using u.position, u.injury_type, u.expected_return as placeholder fields 
+                        // (Assuming the API might have them, otherwise gracefully fallback)
+                        const roleStr = u.role || u.position || '';
+                        const injuryType = u.injury_type || u.injury || '';
+                        const returnDate = u.expected_return || u.return_date || '';
+
                         html += `
                         <div class="unavailable-badge ${badgeClass}">
                             <div class="unavailable-name">${escapeHTML(u.name)}</div>
                             <div class="unavailable-meta">
-                                ${u.role||u.position?`<span class="unavailable-role">${escapeHTML(u.role||u.position)}</span>`:''}
-                                ${u.injury_type||u.injury?`<span class="unavailable-reason ${badgeClass==='suspension'?'suspension-reason':''}">${escapeHTML(u.injury_type||u.injury)}</span>`:''}
-                                ${u.expected_return||u.return_date?`<span class="unavailable-return">⏳ ${escapeHTML(u.expected_return||u.return_date)}</span>`:''}
+                                ${roleStr ? `<span class="unavailable-role">${escapeHTML(roleStr)}</span>` : ''}
+                                ${injuryType ? `<span class="unavailable-reason ${reasonClass}">${escapeHTML(injuryType)}</span>` : (u.reason ? `<span class="unavailable-reason ${reasonClass}">${escapeHTML(u.reason)}</span>` : '')}
+                                ${returnDate ? `<span class="unavailable-return">⏳ Expected back: ${escapeHTML(returnDate)}</span>` : ''}
                             </div>
                         </div>`;
                     });
                     html += `</div></div>`;
+                } else {
+                    html += `<div style="margin-top: 15px; background: #1a1a1a; padding: 12px; border-radius: 8px; border: 1px solid #2a2a2a;">`;
+                    html += `<div style="font-weight: 600; color: #aaa; margin-bottom: 8px;">🚑 ${escapeHTML(names[idx])}</div>`;
+                    html += `<div style="color: #666; font-size: 0.9rem;">✅ Full squad available</div>`;
+                    html += `</div>`;
                 }
             });
+            html += `</div>`;
             unavailEl.innerHTML = html;
         } else {
-            unavailEl.innerHTML = '<div style="color:#555;text-align:center;padding:20px;">No absentee data available.</div>';
+            unavailBtn.style.display = 'none';
+            unavailEl.innerHTML = '<div style="color: #555; text-align: center; padding: 20px;">No Unavailable player data available.</div>';
         }
+    }
+
+    function startModalLiveUpdates(id, home, away) {
+        if (modalLiveInterval) clearInterval(modalLiveInterval);
+        modalLiveInterval = setInterval(() => {
+            if (document.getElementById('modal').style.display === 'block' && currentModalMatchId === id) {
+                refreshModalMatchData(id);
+            } else {
+                clearInterval(modalLiveInterval);
+                modalLiveInterval = null;
+            }
+        }, 30000);
     }
 
     function renderSquad(divId, teamName, list, formation, manager) {
         const el = document.getElementById(divId);
-        el.innerHTML = `<div class="team-meta"><div class="team-meta-name">${escapeHTML(teamName)}</div>${formation?`<div class="formation-badge">▣ ${formation}</div>`:''}${manager?`<div style="font-size:0.7rem;color:#aaa;">🧑‍💼 ${manager}</div>`:''}</div>`;
-        if (!list || list.length === 0) { el.innerHTML += '<div style="color:#555;">Lineup not available</div>'; return; }
+        el.innerHTML = `<div class="team-meta"><div class="team-meta-name">${escapeHTML(teamName)}</div>${formation?`<div class="formation-badge">▣ ${formation}</div>`:''}${manager?`<div style="font-size:0.7rem;color:#aaa;margin-top:4px;">🧑‍💼 ${manager}</div>`:''}</div>`;
+        if (!list || list.length === 0) { el.innerHTML += '<div style="color:#555;font-size:0.75rem;padding:5px;">Lineup not available</div>'; return; }
         list.forEach(p => {
             const pName = resolveName(p) || resolveName(p.player) || 'Unknown';
             const pos = resolvePosition(p);
             const cat = posCategory(pos);
             const posClass = cat==='GK'?'pos-GK':cat==='DEF'?'pos-DEF':cat==='MID'?'pos-MID':cat==='FWD'?'pos-FWD':'';
-            el.innerHTML += `<div class="player-item"><span>${p.jersey_number||p.number?`<span style="color:#555;margin-right:5px;">${p.jersey_number||p.number}</span>`:''}${escapeHTML(pName)}</span><span class="pos-badge ${posClass}">${pos||'?'}</span></div>`;
+            const jerseyNum = p.jersey_number || p.shirt_number || p.number || p.squad_number || '';
+            el.innerHTML += `<div class="player-item"><span>${jerseyNum?`<span style="color:#555;font-size:0.7rem;margin-right:5px;">${jerseyNum}</span>`:''}${escapeHTML(pName)}</span><span class="pos-badge ${posClass}">${pos||'?'}</span></div>`;
         });
     }
 
@@ -1058,39 +1100,94 @@
     }
     function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
 
+    // --- Navigate Views ---
     function setView(view) {
         currentView = view;
         document.querySelectorAll('.header-nav button').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.header-nav button').forEach(b => {
+            if((view === 'matches' && b.innerText === 'Matches') ||
+               (view === 'players' && b.innerText === 'Players') ||
+               (view === 'managers' && b.innerText === 'Managers')) {
+                b.classList.add('active');
+            }
+        });
+        
+        const mainEl = document.getElementById('main-content');
+        
         if (view === 'matches') {
-            document.querySelector('.header-nav button:first-child').classList.add('active');
-            renderMainContent();
+            if (selectedLeague === null) mainEl.innerHTML = renderGroupedByLeague(allMatches);
+            else {
+                const leagueMatches = leagueMap.get(selectedLeague) || [];
+                mainEl.innerHTML = renderSingleLeague(selectedLeague, leagueMatches);
+            }
+            updateCountdowns();
             updateHeaderInfo();
+        } else if (view === 'players') {
+            mainEl.innerHTML = '<div style="text-align:center;padding:20px;">Loading Players...</div>';
+            fetchAndRenderPlayers();
         } else if (view === 'managers') {
-            document.querySelector('.header-nav button:last-child').classList.add('active');
-            document.getElementById('main-content').innerHTML = '<div style="text-align:center;padding:20px;">Loading Managers...</div>';
+            mainEl.innerHTML = '<div style="text-align:center;padding:20px;">Loading Managers...</div>';
             fetchAndRenderManagers();
         }
         if (window.innerWidth <= 768) document.getElementById('sidebar').classList.remove('open');
     }
 
+    // --- Fetch & Render Players ---
+    async function fetchAndRenderPlayers() {
+        try {
+            let url = PLAYERS_API;
+            if (DEFAULT_TEAM_ID > 0) url += `?team=${DEFAULT_TEAM_ID}`;
+            
+            const res = await fetch(url, { headers: { 'Authorization': `Token ${TOKEN}` } });
+            const data = await res.json();
+            const players = data.results || data.data || data || [];
+
+            let html = '<div class="section-label" style="border-bottom: none; color: var(--green);">⚽ SQUAD INTELLIGENCE</div>';
+            html += `<div class="grid-cards">`;
+            players.slice(0, 30).forEach(p => {
+                const pName = resolveName(p) || 'Unknown';
+                const teamName = resolveName(p.current_team) || resolveName(p.team) || resolveName(p.club) || '';
+                const pos = resolvePosition(p) || 'N/A';
+                const photo = p.photo || p.image || p.player_img || p.profile_pic || 'https://i.imgur.com/placeholder.png';
+                const goals = p.stats?.goals ?? p.goals ?? 0;
+                const assists = p.stats?.assists ?? p.assists ?? 0;
+                const played = p.stats?.appearances ?? p.appearances ?? 0;
+                const availability = p.availability || 'available';
+                const availColor = availability === 'available' ? 'var(--green)' : (availability === 'injured' ? '#ff5555' : '#ffaa00');
+                
+                html += `
+                <div class="profile-card">
+                    <img src="${photo}" alt="${pName}">
+                    <span class="profile-name">${escapeHTML(pName)}</span>
+                    <span class="profile-role">${escapeHTML(pos)} · ${escapeHTML(teamName)}</span>
+                    <div style="margin-top: 6px; font-size: 0.75rem; display: flex; justify-content: center; gap: 8px;">
+                        <span style="color:#aaa;">⚽ ${goals}</span>
+                        <span style="color:#aaa;">🎯 ${assists}</span>
+                        <span style="color:#aaa;">📊 ${played}</span>
+                        <span style="color: ${availColor}; font-weight: bold; text-transform: uppercase;">${availability}</span>
+                    </div>
+                </div>`;
+            });
+            html += `</div>`;
+            document.getElementById('main-content').innerHTML = html;
+        } catch(e) {
+            document.getElementById('main-content').innerHTML = '<div class="empty-state">⚠️ Failed to load player profiles.</div>';
+        }
+    }
+
+    // --- Fetch & Render Managers ---
     async function fetchAndRenderManagers() {
         try {
-            let allManagers = [];
-            let page = 1;
-            const limit = 200;
-            while (true) {
-                let url = MANAGERS_API + `?limit=${limit}&offset=${(page-1)*limit}`;
-                if (DEFAULT_TEAM_ID > 0) url += `&team=${DEFAULT_TEAM_ID}`;
-                const res = await fetch(url, { headers: { 'Authorization': `Token ${TOKEN}` } });
-                const data = await res.json();
-                const managers = data.results || data.data || data || [];
-                if (!Array.isArray(managers) || managers.length === 0) break;
-                allManagers = allManagers.concat(managers);
-                if (managers.length < limit) break;
-                page++;
-            }
-            let html = '<div class="section-label" style="color:var(--green);">🧠 MANAGER INTELLIGENCE</div><div class="grid-cards" style="display:flex;flex-wrap:wrap;gap:12px;">';
-            allManagers.forEach(m => {
+            let url = MANAGERS_API;
+            if (DEFAULT_TEAM_ID > 0) url += `?team=${DEFAULT_TEAM_ID}`;
+
+            const res = await fetch(url, { headers: { 'Authorization': `Token ${TOKEN}` } });
+            const data = await res.json();
+            const managers = data.results || data.data || data || [];
+
+            let html = '<div class="section-label" style="border-bottom: none; color: var(--green);">🧠 MANAGER INTELLIGENCE</div>';
+            html += `<div class="grid-cards">`;
+            managers.slice(0, 20).forEach(m => {
                 const mName = resolveName(m) || 'Unknown';
                 const teamName = resolveName(m.team) || resolveName(m.club) || '';
                 const winRate = m.win_rate || m.stats?.winRate || 'N/A';
@@ -1099,27 +1196,27 @@
                 if (pressing > 100) pressing = 80;
                 const profile = m.tactical_profile || 'Balanced';
                 const style = m.defined_style || 'Possession';
+
                 html += `
-                <div class="profile-card" style="background:#1a1a1a;border-radius:12px;padding:14px;width:220px;border:1px solid #333;">
-                    <div style="font-weight:bold;">${escapeHTML(mName)}</div>
-                    <div style="font-size:0.7rem;color:#888;">${escapeHTML(teamName)}</div>
-                    <div style="font-size:0.8rem;margin:8px 0;"><span style="background:#222;padding:2px 8px;border-radius:6px;">▣ ${escapeHTML(formation)}</span> <span style="color:#888;">${style}</span></div>
-                    <div style="font-size:0.75rem;display:flex;gap:8px;flex-wrap:wrap;">
-                        <span style="color:var(--green);">🏆 WR: ${winRate}</span>
-                        <span style="color:#ffaa00;">⚡ Press: ${pressing}%</span>
-                        <span style="color:#66aaff;">📊 ${profile}</span>
+                <div class="profile-card">
+                    <span class="profile-name" style="display:block;">${escapeHTML(mName)}</span>
+                    <span class="profile-role">${escapeHTML(teamName)}</span>
+                    <div style="font-size: 0.8rem; margin: 8px 0;"><span style="background: #222; padding:4px 8px; border-radius: 6px;">▣ ${escapeHTML(formation)}</span> <span style="color: #888; font-size:0.7rem">${style}</span></div>
+                    <div style="font-size: 0.75rem; display: flex; justify-content: center; gap: 12px;">
+                        <span style="color: var(--green);">🏆 WR: ${winRate}</span>
+                        <span style="color: #ffaa00;">⚡ Press: ${pressing}%</span>
+                        <span style="color: #66aaff;">📊 ${profile}</span>
                     </div>
-                    <div style="height:4px;background:#333;border-radius:2px;margin-top:6px;"><div style="width:${pressing}%;height:100%;background:var(--green);border-radius:2px;"></div></div>
+                    <div class="tactical-ruler"><div class="tactical-ruler-fill" style="width: ${pressing}%;"></div></div>
                 </div>`;
             });
-            html += '</div>';
+            html += `</div>`;
             document.getElementById('main-content').innerHTML = html;
         } catch(e) {
-            document.getElementById('main-content').innerHTML = '<div class="empty-state">⚠️ Failed to load managers.</div>';
+            document.getElementById('main-content').innerHTML = '<div class="empty-state">⚠️ Failed to load manager profiles.</div>';
         }
     }
 
-    // Sidebar & global clicks
     document.addEventListener('click', function(e) {
         const sidebar = document.getElementById('sidebar');
         const toggleBtn = document.querySelector('.sidebar-toggle');
@@ -1131,7 +1228,7 @@
 
     loadAllData();
     setInterval(loadAllData, 30000);
-    setInterval(updateLiveTimers, 1000); // tick every second
+    setInterval(updateCountdowns, 15000);
 </script>
 </body>
 </html>
